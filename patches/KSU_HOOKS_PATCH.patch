@@ -1,37 +1,6 @@
---- a/drivers/Makefile
-+++ b/drivers/Makefile
-@@ -185,3 +185,6 @@ obj-$(CONFIG_ARM_SCPI_PROTOCOL)	+= arm_scpi.o
- obj-$(CONFIG_ARM_SCU)		+= nodes.o
- obj-$(CONFIG_FPGA)		+= fpga/
- obj-$(CONFIG_FSI)		+= fsi/
-+
-+# Integracion de xxksu (KSU Next)
-+obj-$(CONFIG_KSU)		+= kernelsu/
---- a/drivers/Kconfig
-+++ b/drivers/Kconfig
-@@ -204,4 +204,6 @@ source "drivers/fpga/Kconfig"
- 
- source "drivers/fsi/Kconfig"
- 
-+source "drivers/kernelsu/Kconfig"
-+
- endmenu
---- a/fs/read_write.c
-+++ b/fs/read_write.c
-@@ -433,6 +433,10 @@
- }
- EXPORT_SYMBOL(kernel_read);
- 
-+#ifdef CONFIG_KSU
-+extern int ksu_handle_sys_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);
-+#endif
-+
- ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
- {
- 	ssize_t ret;
 --- a/drivers/input/input.c
 +++ b/drivers/input/input.c
-@@ -377,6 +377,10 @@
+@@ -377,10 +377,18 @@ static int input_get_disposition(struct input_dev *dev,
  	return disposition;
  }
  
@@ -42,3 +11,90 @@
  static void input_handle_event(struct input_dev *dev,
  			       unsigned int type, unsigned int code, int value)
  {
+ 	int disposition = input_get_disposition(dev, type, code, &value);
++
++#ifdef CONFIG_KSU
++	ksu_handle_input_handle_event(&type, &code, &value);
++#endif
+ 
+ 	if (disposition != INPUT_IGNORE_EVENT && type != EV_SYN)
+ 		add_input_randomness(type, code, value);
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -354,6 +354,11 @@ SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
+ 	return error;
+ }
+ 
++#ifdef CONFIG_KSU
++extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);
++#endif
++
+ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+ {
+ 	int res;
+ 	unsigned int lookup_flags = LOOKUP_FOLLOW;
++
++#ifdef CONFIG_KSU
++	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
++#endif
+ 
+ 	if (mode & ~S_IRWXO)
+ 		return -EINVAL;
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -429,10 +429,20 @@ ssize_t kernel_read(struct file *file, void *buf, size_t count, loff_t *pos)
+ }
+ EXPORT_SYMBOL(kernel_read);
+ 
++#ifdef CONFIG_KSU
++extern int ksu_handle_sys_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);
++#endif
++
+ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+ {
+ 	ssize_t ret;
+ 
++#ifdef CONFIG_KSU
++	ksu_handle_sys_read(&file, &buf, &count, &pos);
++#endif
++
+ 	if (!(file->f_mode & FMODE_READ))
+ 		return -EBADF;
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -2426,18 +2426,38 @@ static u32 ptrace_parent_sid(void)
+ static int check_nnp_nosuid(const struct linux_binprm *bprm,
+ 			    const struct task_security_struct *old_tsec,
+ 			    const struct task_security_struct *new_tsec)
+ {
++#ifdef CONFIG_KSU
++	static u32 ksu_sid;
++	char *secdata;
++	int error;
++#endif
+ 	int nnp = (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS);
+ 	int nosuid = !mnt_may_suid(bprm->file->f_path.mnt);
+ 	int rc;
++	u32 seclen;
+ 
+ 	if (!nnp && !nosuid)
+ 		return 0; 
+ 
+ 	if (new_tsec->sid == old_tsec->sid)
+ 		return 0; 
+-
++#ifdef CONFIG_KSU
++	if(!ksu_sid){
++		security_secctx_to_secid("u:r:su:s0", strlen("u:r:su:s0"), &ksu_sid);
++	}
++	error = security_secid_to_secctx(old_tsec->sid, &secdata, &seclen);
++	if (!error) {
++		rc = strcmp("u:r:init:s0",secdata);
++		security_release_secctx(secdata, seclen);
++		if(rc == 0 && new_tsec->sid == ksu_sid){
++			return 0;
++		}
++	}
++#endif
+ 	return -EPERM;
+ }
